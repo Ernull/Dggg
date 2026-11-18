@@ -1,5 +1,5 @@
 """
-🚀 Nexus Extractor - PRO TELEGRAM BOT & WEB GATEWAY (UPDATED & FIXED)
+🚀 Nexus Extractor - PRO TELEGRAM BOT & WEB GATEWAY (STABLE & TESTED)
 """
 import os
 import json
@@ -11,6 +11,7 @@ import urllib.parse
 import re
 import time
 import io
+import html
 import threading
 import urllib3
 import hashlib
@@ -37,14 +38,24 @@ ADMIN_IDS = [int(x.strip()) for x in admin_ids_env.split(",") if x.strip().isdig
 
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://your-domain.com").rstrip('/')
 PORT = int(os.environ.get("PORT", "8080"))
-REDIS_URL = os.environ.get("REDIS_URL", "redis://default:DWYgsUKwUJTjTMQpasIEHBYVPEMMhoPt@altaria.proxy.rlwy.net:22748")
+REDIS_URL = os.environ.get(
+    "REDIS_URL",
+    "redis://default:DWYgsUKwUJTjTMQpasIEHBYVPEMMhoPt@altaria.proxy.rlwy.net:22748"
+)
 
 APP_SECRET_HEADER = "JetApp-Secure-Client"
-JET_API = "https://api.digikalajet.ir"
+JET_API_BASE = "https://api.digikalajet.ir"
+JET_APP_ID = "08f293bd-0e29-4794-897c-a111b19da003"
+CLEAN_ACCOUNTS_FILE = "clean_accounts.txt"
 
 # اتصال امن با تایم‌اوت به دیتابیس ردیس
 try:
-    redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
+    redis_client = redis.Redis.from_url(
+        REDIS_URL,
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=5
+    )
 except Exception as e:
     logging.error(f"Redis Init Error: {e}")
     redis_client = None
@@ -56,6 +67,14 @@ logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO)
 user_data = {}
 user_proxies = {}
 
+MENU_BUTTONS = {
+    "📦 دریافت حساب‌های بدون سفارش",
+    "📊 آمار لینک‌های ساخته شده",
+    "🌐 تنظیم پروکسی",
+    "⚙️ پنل مدیریت",
+}
+
+
 # ================= Helper Functions =================
 def generate_pkce():
     verifier = secrets.token_urlsafe(64)
@@ -63,10 +82,12 @@ def generate_pkce():
     challenge = base64.urlsafe_b64encode(hashed).decode('ascii').rstrip('=')
     return verifier, challenge
 
+
 def normalize_digits(text):
-    """تبدیل اعداد فارسی به انگلیسی"""
-    p2e = str.maketrans('۰۱۲۳۴۵۶۷۸۹', '0123456789')
+    """تبدیل اعداد فارسی و عربی به انگلیسی"""
+    p2e = str.maketrans('۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩', '01234567890123456789')
     return text.translate(p2e).strip()
+
 
 def format_proxy(p_str):
     p_str = p_str.strip()
@@ -76,56 +97,102 @@ def format_proxy(p_str):
         p_str = f"http://{p_str}"
     return p_str
 
-def get_main_keyboard():
+
+def get_main_keyboard(is_admin=False):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    btn_stats = types.KeyboardButton("📊 آمار و پنل مدیریت")
     btn_clean = types.KeyboardButton("📦 دریافت حساب‌های بدون سفارش")
+    btn_stats = types.KeyboardButton("📊 آمار لینک‌های ساخته شده")
     btn_proxy = types.KeyboardButton("🌐 تنظیم پروکسی")
-    markup.add(btn_stats)
-    markup.add(btn_clean, btn_proxy)
+    if is_admin:
+        btn_admin = types.KeyboardButton("⚙️ پنل مدیریت")
+        markup.add(btn_clean, btn_stats)
+        markup.add(btn_proxy, btn_admin)
+    else:
+        markup.add(btn_clean, btn_stats, btn_proxy)
     return markup
 
-def get_admin_inline_keyboard():
-    """ساخت کیبورد شیشه‌ای پنل مدیریت به همراه آمار لحظه‌ای"""
-    bulk_count = 0
-    sessions_count = 0
-    processed_count = 0
-    if redis_client:
+
+def get_admin_inline_markup():
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("📊 بروزرسانی آمار لینک‌ها", callback_data="adm_stats"),
+        types.InlineKeyboardButton("🔗 دریافت فایل لینک‌های ساخته شده", callback_data="adm_export_links"),
+        types.InlineKeyboardButton("📦 دریافت فایل حساب‌های بدون سفارش", callback_data="adm_export_clean"),
+        types.InlineKeyboardButton("🌐 تنظیم پروکسی", callback_data="adm_set_proxy"),
+    )
+    return markup
+
+
+def get_link_stats(chat_id=None):
+    """محاسبه آمار دقیق لینک‌ها و اکانت‌های ذخیره‌شده"""
+    stats = {
+        "redis_ok": False,
+        "bulk_links": 0,
+        "active_sessions": 0,
+        "total_created_counter": 0,
+        "skipped_ordered_counter": 0,
+        "clean_file_count": 0,
+        "proxy_count": len(user_proxies.get(chat_id, [])) if chat_id else 0,
+    }
+
+    if os.path.exists(CLEAN_ACCOUNTS_FILE):
         try:
-            bulk_count = redis_client.hlen("jet:bulk_accounts")
-            sessions_count = len(redis_client.keys("jet_session:*"))
-            processed_count = redis_client.scard("jet:processed_phones")
+            with open(CLEAN_ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+                stats["clean_file_count"] = sum(1 for line in f if line.strip())
         except Exception:
             pass
 
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        types.InlineKeyboardButton(f"🔗 دریافت لینک‌های ساخته شده ({bulk_count} عدد)", callback_data="adm_export_links"),
-        types.InlineKeyboardButton(f"📊 بروزرسانی آمار (سشن فعال: {sessions_count} | ثبت‌شده: {processed_count})", callback_data="adm_refresh_stats"),
-        types.InlineKeyboardButton("🌐 تنظیم پروکسی", callback_data="adm_set_proxy"),
-        types.InlineKeyboardButton("🗑 پاک‌سازی اکانت‌های خریددار احتمالی از ردیس", callback_data="adm_purge_ordered_hash")
-    )
-    return markup, bulk_count, sessions_count, processed_count
+    if redis_client:
+        try:
+            redis_client.ping()
+            stats["redis_ok"] = True
+            stats["bulk_links"] = redis_client.hlen("jet:bulk_accounts") or 0
+            stats["active_sessions"] = sum(1 for _ in redis_client.scan_iter("jet_session:*", count=500))
+            created_raw = redis_client.get("jet:stats:created_links")
+            skipped_raw = redis_client.get("jet:stats:skipped_ordered")
+            stats["total_created_counter"] = int(created_raw) if created_raw and str(created_raw).isdigit() else stats["bulk_links"]
+            stats["skipped_ordered_counter"] = int(skipped_raw) if skipped_raw and str(skipped_raw).isdigit() else 0
+        except Exception as e:
+            logging.error(f"Redis Stats Error: {e}")
 
-def send_final_file(chat_id, status_message, logs, extracted_data=None):
+    return stats
+
+
+def format_stats_message(chat_id=None):
+    s = get_link_stats(chat_id)
+    redis_status = "🟢 متصل" if s["redis_ok"] else "🔴 قطع"
+    return (
+        "📊 <b>آمار لینک‌ها و وضعیت سیستم Nexus</b>\n\n"
+        f"• وضعیت دیتابیس Redis: {redis_status}\n"
+        f"• لینک‌های سالم ذخیره‌شده: <b>{s['bulk_links']}</b>\n"
+        f"• سشن‌های فعال فعلی: <b>{s['active_sessions']}</b>\n"
+        f"• کل لینک‌های ساخته‌شده (ثبت‌شده): <b>{s['total_created_counter']}</b>\n"
+        f"• اکانت‌های خریددارِ رد شده (ذخیره‌نشده): <b>{s['skipped_ordered_counter']}</b>\n"
+        f"• تعداد رکورد فایل متنی بدون سفارش: <b>{s['clean_file_count']}</b>\n"
+        f"• پروکسی‌های فعال شما: <b>{s['proxy_count']}</b>\n\n"
+        f"🕒 بروزرسانی: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+    )
+
+
+def send_final_file(chat_id, status_message, logs, extracted_data=None, is_admin=False):
     try:
-        bot.send_message(chat_id, status_message, reply_markup=get_main_keyboard())
+        bot.send_message(chat_id, status_message, reply_markup=get_main_keyboard(is_admin))
         report_text = "\n".join(logs)
         if extracted_data:
-            report_text += "\n\n====== [ اطلاعات خروجی نشست ] ======\n"
+            report_text += "\n\n====== [ اطلاعات خروجی ] ======\n"
             report_text += json.dumps(extracted_data, ensure_ascii=False, indent=4)
-            
+
         file_obj = io.BytesIO(report_text.encode('utf-8'))
         file_obj.name = f"Nexus_Report_{int(time.time())}.txt"
         bot.send_document(chat_id, file_obj, caption="📄 فایل لاگ و دیتای نشست")
     except Exception as e:
         bot.send_message(chat_id, f"❌ خطا در ارسال فایل لاگ: {str(e)}")
 
-# ================= Jet API & Order History (Fixed via jet_cleaner logic) =================
-def build_jet_headers(tok=None):
-    """ساخت هدرهای استاندارد و دقیق دیجی‌کالاجت مطابق jet_cleaner.py"""
+
+def build_jet_headers(jet_token=None):
+    """ساخت هدرهای استاندارد دیجی‌کالاجت مطابق jet_cleaner.py"""
     cid = 'FINGERPRINTV2-' + uuid.uuid4().hex
-    h = {
+    hdrs = {
         'Accept': 'application/json, text/plain, */*',
         'X-Request-UUID': str(uuid.uuid4()),
         'ClientId': cid,
@@ -134,50 +201,45 @@ def build_jet_headers(tok=None):
         'Client': 'mobile',
         'platform-sso-disable-prod': '1',
         'session': f"{uuid.uuid4()}-V3*{int(time.time())}",
-        'app-id': '08f293bd-0e29-4794-897c-a111b19da003',
+        'app-id': JET_APP_ID,
+        'Content-Type': 'application/json',
         'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36',
         'Origin': 'https://www.digikalajet.com',
         'Referer': 'https://www.digikalajet.com/',
     }
-    if tok:
-        h['Authorization'] = tok
-    return h
+    if jet_token:
+        hdrs['Authorization'] = jet_token
+    return hdrs
 
-def count_orders(payload):
-    """تعداد کل سفارش‌ها با هر وضعیتی (تحویل‌شده، در جریان یا لغوشده) دقیقاً مطابق jet_cleaner.py"""
-    data = payload.get('data') or {}
-    total = (data.get('pager') or {}).get('total_items', 0) or 0
-    orders = data.get('orders') or {}
+
+def count_orders_payload(payload):
+    """تعداد کل سفارش‌ها با هر وضعیتی (تحویل‌شده، در جریان یا لغوشده) مطابق jet_cleaner.py"""
+    if not isinstance(payload, dict):
+        return 0
+    data_obj = payload.get('data') or {}
+    total = (data_obj.get('pager') or {}).get('total_items', 0) or 0
+    orders = data_obj.get('orders') or {}
     if isinstance(orders, dict):
         total = max(total, sum(len(b) for b in orders.values() if isinstance(b, list)))
     return total
 
-def build_jet_origins(jet_token, jet_refresh_token, phone):
-    """ساخت ساختار استاندارد persist:DKNow برای سازگاری کامل با پنل و jet_cleaner.py"""
-    if not jet_token:
-        return []
-    user_dict = {
-        "token": jet_token,
-        "refreshToken": jet_refresh_token or "",
-        "phone": phone
-    }
-    persist_val = {
-        "user": json.dumps(user_dict, ensure_ascii=False),
-        "_persist": '{"version":-1,"rehydrated":true}'
-    }
-    return [{
-        "origin": "https://www.digikalajet.com",
-        "localStorage": [{
-            "name": "persist:DKNow",
-            "value": json.dumps(persist_val, ensure_ascii=False)
-        }]
-    }]
+
+def extract_sa_token_from_url(url_str):
+    if not url_str:
+        return None
+    parsed = urllib.parse.urlparse(url_str)
+    qs = urllib.parse.parse_qs(parsed.query)
+    if 'sa_token' in qs and qs['sa_token']:
+        return qs['sa_token'][0]
+    match = re.search(r'sa_token=([^&]+)', url_str)
+    return urllib.parse.unquote(match.group(1)) if match else None
+
 
 def check_purchase_history(session, dk_token, logs):
     """
-    بررسی دقیق سوابق خرید از طریق API دیجی‌کالاجت.
-    خروجی: (status_verdict, total_orders, jet_token, jet_refresh_token)
-    status_verdict: 'clean' | 'ordered' | 'error'
+    استخراج تاریخچه خریدها از طریق API دیجی‌کالاجت.
+    خروجی: تاپل (total_orders, jet_token, jet_refresh).
+    اگر بررسی با خطا مواجه شود، total_orders برابر None برمی‌گردد تا اکانت اشتباهاً خام ذخیره نشود.
     """
     try:
         logs.append("▶️ در حال بررسی سوابق خرید (ارتباط با دیجی‌کالاجت)...")
@@ -187,21 +249,17 @@ def check_purchase_history(session, dk_token, logs):
             "x-web-optimize-response": "1",
             "Referer": "https://www.digikala.com/",
             "Authorization": f"Bearer {dk_token}" if not dk_token.startswith("Bearer") else dk_token,
-            "User-Agent": session.headers.get("User-Agent", "Mozilla/5.0")
+            "User-Agent": session.headers.get("User-Agent", "Mozilla/5.0"),
         }
 
-        sa_token = None
         res_sa = session.get(
             "https://api.digikala.com/super-app/v1/sso/jet/",
             params={"redirect_url": "/?utm_source=digikala-superweb"},
             headers=sa_headers,
             allow_redirects=False,
-            timeout=12
+            timeout=12,
         )
-        if 'Location' in res_sa.headers:
-            match = re.search(r'sa_token=([^&]+)', res_sa.headers['Location'])
-            if match:
-                sa_token = match.group(1)
+        sa_token = extract_sa_token_from_url(res_sa.headers.get('Location'))
 
         if not sa_token:
             res_sa_redirect = session.get(
@@ -209,224 +267,262 @@ def check_purchase_history(session, dk_token, logs):
                 params={"redirect_url": "/?utm_source=digikala-superweb"},
                 headers=sa_headers,
                 allow_redirects=True,
-                timeout=12
+                timeout=12,
             )
-            parsed = urllib.parse.urlparse(res_sa_redirect.url)
-            qs = urllib.parse.parse_qs(parsed.query)
-            if 'sa_token' in qs:
-                sa_token = qs['sa_token'][0]
+            sa_token = extract_sa_token_from_url(res_sa_redirect.url)
 
         if not sa_token:
-            logs.append("❌ خطا در دریافت توکن SA_TOKEN از دیجی‌کالا")
-            return 'error', -1, None, None
+            logs.append(f"❌ خطا در دریافت SA_TOKEN | Status: {res_sa.status_code}")
+            return None, None, None
 
-        # لاگین در سوپراپ جت
-        sso_headers = build_jet_headers()
-        sso_headers['Content-Type'] = 'application/json'
-        res_jet = session.post(
-            f"{JET_API}/super-app-sso/",
-            headers=sso_headers,
-            json={"dsa_token": sa_token},
-            timeout=15
-        )
-        if res_jet.status_code != 200:
-            logs.append(f"❌ خطا در لاگین جت | Status: {res_jet.status_code}")
-            return 'error', -1, None, None
+        # لاگین در API جت با هدرهای صحیح jet_cleaner.py
+        jet_headers = build_jet_headers()
+        res_jet = None
+        for attempt in range(3):
+            try:
+                res_jet = session.post(
+                    f"{JET_API_BASE}/super-app-sso/",
+                    headers=jet_headers,
+                    json={"dsa_token": sa_token},
+                    timeout=15,
+                )
+                if res_jet.status_code == 200:
+                    break
+            except requests.RequestException:
+                if attempt == 2:
+                    raise
 
-        jet_data = (res_jet.json() or {}).get('data') or {}
+        if not res_jet or res_jet.status_code != 200:
+            code = res_jet.status_code if res_jet else "NoResponse"
+            logs.append(f"❌ خطا در لاگین جت | Status: {code}")
+            return None, None, None
+
+        jet_json = res_jet.json()
+        jet_data = jet_json.get('data') or {}
         jet_token = jet_data.get('token')
-        jet_refresh = jet_data.get('refresh_token') or jet_data.get('refreshToken') or ""
+        jet_refresh = jet_data.get('refresh_token') or jet_data.get('refreshToken')
 
         if not jet_token:
-            logs.append("❌ توکن نهایی جت در پاسخ یافت نشد.")
-            return 'error', -1, None, None
+            logs.append("❌ توکن نهایی جت یافت نشد.")
+            return None, None, None
 
-        # دریافت لیست سفارش‌ها با تلاش مجدد و پشتیبانی از Refresh Token (مشابه jet_cleaner.py)
-        for attempt in range(3):
-            res_orders = session.get(
-                f"{JET_API}/order-shipments/?ch=jj",
-                headers=build_jet_headers(jet_token),
-                timeout=15
-            )
+        # دریافت لیست سفارش‌ها با منطق jet_cleaner.py (شامل تلاش مجدد و refresh در 401/402)
+        def fetch_orders(tok):
+            last_code, last_payload = None, {}
+            for _ in range(3):
+                try:
+                    hdrs = build_jet_headers(tok)
+                    r_ord = session.get(f"{JET_API_BASE}/order-shipments/?ch=jj", headers=hdrs, timeout=20)
+                    last_code = r_ord.status_code
+                    try:
+                        last_payload = r_ord.json()
+                    except Exception:
+                        last_payload = {}
+                    if last_code == 200:
+                        return last_code, last_payload
+                except requests.RequestException:
+                    continue
+            return last_code, last_payload
+
+        code, payload = fetch_orders(jet_token)
+        api_status = payload.get('status') if isinstance(payload, dict) else None
+
+        if (code in (401, 402) or api_status in (401, 402)) and jet_refresh:
+            logs.append("⚠️ توکن جت نیاز به بروزرسانی داشت، در حال refresh...")
             try:
-                payload = res_orders.json()
-            except Exception:
-                payload = {}
-
-            api_status = payload.get("status") if isinstance(payload, dict) else None
-
-            if res_orders.status_code == 200 and api_status == 200:
-                total_orders = count_orders(payload)
-                logs.append(f"✅ سوابق خرید با موفقیت بررسی شد | تعداد کل سفارش‌ها: {total_orders}")
-                verdict = 'ordered' if total_orders > 0 else 'clean'
-                return verdict, total_orders, jet_token, jet_refresh
-
-            # در صورت انقضای توکن، رفرش انجام شود
-            if (res_orders.status_code in (401, 402) or api_status in (401, 402)) and jet_refresh:
-                logs.append("🔄 توکن جت نیاز به رفرش دارد، در حال ارسال درخواست رفرش...")
-                ref_res = session.post(
-                    f"{JET_API}/user/refresh-token/?ch=jj",
-                    json={"refresh_token": jet_refresh, "token": jet_token},
+                r_ref = session.post(
+                    f"{JET_API_BASE}/user/refresh-token/?ch=jj",
                     headers={'User-Agent': 'Mozilla/5.0', 'Content-Type': 'application/json'},
-                    timeout=15
+                    json={"refresh_token": jet_refresh, "token": jet_token},
+                    timeout=20,
                 )
-                if ref_res.status_code == 200:
-                    ref_json = ref_res.json() or {}
-                    ref_pay = ref_json.get('data') if isinstance(ref_json.get('data'), dict) else ref_json
-                    if ref_pay.get('token'):
-                        jet_token = ref_pay['token']
-                        jet_refresh = ref_pay.get('refresh_token') or jet_refresh
-                        continue
+                if r_ref.status_code == 200:
+                    ref_json = r_ref.json()
+                    pay = ref_json.get('data') if isinstance(ref_json, dict) else None
+                    if not isinstance(pay, dict):
+                        pay = ref_json if isinstance(ref_json, dict) else {}
+                    new_tok = pay.get('token')
+                    new_ref = pay.get('refresh_token') or pay.get('refreshToken') or jet_refresh
+                    if new_tok:
+                        jet_token = new_tok
+                        jet_refresh = new_ref
+                        code, payload = fetch_orders(jet_token)
+                        api_status = payload.get('status') if isinstance(payload, dict) else None
+            except Exception as ref_err:
+                logs.append(f"⚠️ خطا در refresh توکن جت: {ref_err}")
 
-        logs.append("❌ خطا در استعلام سفارش‌ها از سرور جت پس از ۳ بار تلاش.")
-        return 'error', -1, jet_token, jet_refresh
+        if code == 200 and api_status == 200:
+            total_orders = count_orders_payload(payload)
+            logs.append(f"✅ سوابق خرید استخراج شد: {total_orders}")
+            return total_orders, jet_token, jet_refresh
 
+        logs.append(f"❌ پاسخ نامعتبر از سرویس سفارش‌ها | HTTP: {code} | API: {api_status}")
+        return None, jet_token, jet_refresh
     except Exception as e:
         logs.append(f"❌ خطای چک کردن خرید: {str(e)}")
-        return 'error', -1, None, None
+        return None, None, None
 
-def delete_account_from_redis(phone):
-    """حذف کامل اکانت خریددار از ردیس دقیقاً به روش jet_cleaner.py"""
-    if not redis_client:
-        return
-    for hk in ('jet:bulk_accounts', 'jet:ordered_accounts'):
-        rec_raw = redis_client.hget(hk, phone)
-        if rec_raw:
-            try:
-                tok = (json.loads(rec_raw) or {}).get('token')
-            except Exception:
-                tok = None
-            pipe = redis_client.pipeline()
-            if tok:
-                pipe.delete(f"jet_session:{tok}")
-                pipe.hdel('jet:session_backups', tok)
-            pipe.hdel(hk, phone)
-            pipe.srem('jet:processed_phones', phone)
-            pipe.execute()
 
 # ================= Telegram Handlers =================
 @bot.message_handler(commands=['start', 'help', 'admin'])
-@bot.message_handler(func=lambda m: m.text == "📊 آمار و پنل مدیریت")
 def send_welcome(message):
     if message.from_user.id not in ADMIN_IDS:
         return
-    markup, bulk_cnt, sess_cnt, proc_cnt = get_admin_inline_keyboard()
-    panel_text = (
-        "⚙️ **پنل مدیریت مرکزی Nexus:**\n\n"
-        f"🔗 **لینک‌های بدون خرید (آماده):** `{bulk_cnt}`\n"
-        f"🟢 **سشن‌های فعال در ردیس:** `{sess_cnt}`\n"
-        f"📱 **شماره‌های پردازش‌شده:** `{proc_cnt}`\n\n"
-        "💡 *توجه: اکانت‌های دارای سابقه خرید به هیچ عنوان در سیستم ذخیره نمی‌شوند.*\n"
-        "لطفاً یکی از گزینه‌های زیر را انتخاب کنید:"
+    chat_id = message.chat.id
+    stats_text = format_stats_message(chat_id)
+    bot.send_message(
+        chat_id,
+        f"⚙️ <b>پنل مدیریت مرکزی Nexus</b>\n\n{stats_text}",
+        reply_markup=get_admin_inline_markup(),
+        parse_mode="HTML",
     )
-    bot.send_message(message.chat.id, panel_text, reply_markup=markup, parse_mode="Markdown")
-    if message.text and message.text.startswith("/"):
-        bot.send_message(message.chat.id, "محیط آماده به کار است. برای ورود شماره موبایل بفرستید:", reply_markup=get_main_keyboard())
+    bot.send_message(
+        chat_id,
+        "📱 برای شروع استخراج، شماره موبایل (مثلاً 09123456789) را ارسال کنید یا از دکمه‌های زیر استفاده کنید:",
+        reply_markup=get_main_keyboard(is_admin=True),
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == "⚙️ پنل مدیریت")
+def open_admin_panel(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    chat_id = message.chat.id
+    bot.send_message(
+        chat_id,
+        f"⚙️ <b>پنل مدیریت مرکزی Nexus</b>\n\n{format_stats_message(chat_id)}",
+        reply_markup=get_admin_inline_markup(),
+        parse_mode="HTML",
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == "📊 آمار لینک‌های ساخته شده")
+def show_stats_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    bot.send_message(
+        message.chat.id,
+        format_stats_message(message.chat.id),
+        reply_markup=get_main_keyboard(is_admin=True),
+        parse_mode="HTML",
+    )
+
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("adm_"))
 def admin_callback(call):
     if call.from_user.id not in ADMIN_IDS:
         return
     chat_id = call.message.chat.id
+    bot.answer_callback_query(call.id)
 
-    if not redis_client:
-        bot.answer_callback_query(call.id, "❌ اتصال ردیس برقرار نیست.", show_alert=True)
+    if call.data == "adm_stats":
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=call.message.message_id,
+                text=f"⚙️ <b>پنل مدیریت مرکزی Nexus</b>\n\n{format_stats_message(chat_id)}",
+                reply_markup=get_admin_inline_markup(),
+                parse_mode="HTML",
+            )
+        except Exception:
+            bot.send_message(
+                chat_id,
+                f"⚙️ <b>پنل مدیریت مرکزی Nexus</b>\n\n{format_stats_message(chat_id)}",
+                reply_markup=get_admin_inline_markup(),
+                parse_mode="HTML",
+            )
         return
 
-    if call.data == "adm_refresh_stats":
-        markup, bulk_cnt, sess_cnt, proc_cnt = get_admin_inline_keyboard()
-        panel_text = (
-            "⚙️ **پنل مدیریت مرکزی Nexus:**\n\n"
-            f"🔗 **لینک‌های بدون خرید (آماده):** `{bulk_cnt}`\n"
-            f"🟢 **سشن‌های فعال در ردیس:** `{sess_cnt}`\n"
-            f"📱 **شماره‌های پردازش‌شده:** `{proc_cnt}`\n\n"
-            "💡 *توجه: اکانت‌های دارای سابقه خرید به هیچ عنوان در سیستم ذخیره نمی‌شوند.*\n"
-            "لطفاً یکی از گزینه‌های زیر را انتخاب کنید:"
-        )
-        try:
-            bot.edit_message_text(panel_text, chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-        except Exception:
-            pass
-        bot.answer_callback_query(call.id, "✅ آمار بروزرسانی شد.")
+    if call.data == "adm_export_clean":
+        if os.path.exists(CLEAN_ACCOUNTS_FILE) and os.path.getsize(CLEAN_ACCOUNTS_FILE) > 0:
+            with open(CLEAN_ACCOUNTS_FILE, "rb") as f:
+                bot.send_document(chat_id, f, caption="📦 لیست حساب‌های بدون سفارش ثبت‌شده.")
+        else:
+            bot.send_message(chat_id, "❌ هنوز هیچ حساب بدون سفارشی در فایل ثبت نشده است.")
+        return
 
-    elif call.data == "adm_export_links":
-        bot.answer_callback_query(call.id)
+    if call.data == "adm_set_proxy":
+        msg = bot.send_message(chat_id, "🌐 لطفاً پروکسی‌های خود را ارسال کنید (هر خط یک پروکسی یا فایل .txt):")
+        bot.register_next_step_handler(msg, process_proxy_list)
+        return
+
+    if not redis_client:
+        bot.send_message(chat_id, "❌ خطا: اتصال ردیس برقرار نیست.")
+        return
+
+    if call.data == "adm_export_links":
         try:
             records = redis_client.hgetall("jet:bulk_accounts")
             if not records:
                 bot.send_message(chat_id, "❌ هیچ لینکی در سیستم موجود نیست.")
                 return
-            text_content = f"🔗 لیست کل لینک‌های بدون سابقه خرید (تعداد کل: {len(records)}):\n\n"
-            valid_count = 0
+            lines = [f"🔗 لیست لینک‌های سالم ساخته شده (تعداد: {len(records)}):\n"]
             for phone, val in records.items():
                 try:
                     data = json.loads(val)
-                    token = data.get('token', '')
-                    if not token:
-                        continue
-                    link = f"{WEBHOOK_URL}/auth/{token}"
-                    text_content += f"📱 شماره: {phone}\n🔗 لینک: {link}\n──────────────────\n"
-                    valid_count += 1
+                    link = f"{WEBHOOK_URL}/auth/{data.get('token', '')}"
+                    created_at = data.get("created_at", "")
+                    line = f"📱 شماره: {phone}\n🔗 لینک: {link}"
+                    if created_at:
+                        line += f"\n🕒 زمان: {created_at}"
+                    lines.append(line + "\n──────────────────")
                 except Exception:
                     continue
+            text_content = "\n".join(lines)
             file_bytes = io.BytesIO(text_content.encode('utf-8'))
             file_bytes.name = f"Nexus_Clean_Links_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            bot.send_document(chat_id, file_bytes, caption=f"✅ لیست {valid_count} لینک ورود (بدون سابقه خرید) آماده شد.")
+            bot.send_document(chat_id, file_bytes, caption=f"✅ لیست {len(records)} لینک ورود سالم آماده شد.")
         except Exception as e:
-            bot.send_message(chat_id, f"❌ خطای ردیس: {e}")
+            bot.send_message(chat_id, f"❌ خطای ردیس: {html.escape(str(e))}", parse_mode="HTML")
 
-    elif call.data == "adm_purge_ordered_hash":
-        try:
-            ordered_records = redis_client.hgetall("jet:ordered_accounts")
-            removed = 0
-            for phone in ordered_records.keys():
-                delete_account_from_redis(phone)
-                removed += 1
-            bot.answer_callback_query(call.id, f"✅ تعداد {removed} اکانت خریددار قدیمی حذف شد.", show_alert=True)
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ خطا: {e}", show_alert=True)
-
-    elif call.data == "adm_set_proxy":
-        bot.answer_callback_query(call.id)
-        bot.send_message(chat_id, "🌐 لطفاً پروکسی‌های خود را ارسال کنید (هر خط یک پروکسی یا فایل txt):")
-        bot.register_next_step_handler(call.message, process_proxy_list)
 
 @bot.message_handler(func=lambda m: m.text == "📦 دریافت حساب‌های بدون سفارش")
 def get_clean_accounts(message):
     if message.from_user.id not in ADMIN_IDS:
         return
     chat_id = message.chat.id
-    file_path = "clean_accounts.txt"
-    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-        with open(file_path, "rb") as f:
-            bot.send_document(chat_id, f, caption="📦 لیست حساب‌های خامی که هیچ سفارشی نداشته‌اند.")
+    if os.path.exists(CLEAN_ACCOUNTS_FILE) and os.path.getsize(CLEAN_ACCOUNTS_FILE) > 0:
+        with open(CLEAN_ACCOUNTS_FILE, "rb") as f:
+            bot.send_document(chat_id, f, caption="📦 لیست حساب‌های خامی که سفارش نداشته‌اند.")
     else:
-        bot.send_message(chat_id, "❌ هنوز هیچ حساب کاربری بدون سفارشی در فایل محلی ثبت نشده است.", reply_markup=get_main_keyboard())
+        bot.send_message(chat_id, "❌ هنوز هیچ حساب کاربری بدون سفارشی ثبت نشده است.", reply_markup=get_main_keyboard(True))
+
 
 @bot.message_handler(func=lambda m: m.text == "🌐 تنظیم پروکسی" or m.text == "/proxy")
 def setup_proxy(message):
     if message.from_user.id not in ADMIN_IDS:
         return
-    msg = ("🌐 **تنظیمات پروکسی:**\n\n"
-           "لطفاً پروکسی‌های خود را بفرستید. (پیام متنی یا فایل .txt)")
-    bot.reply_to(message, msg, parse_mode="Markdown")
-    bot.register_next_step_handler(message, process_proxy_list)
+    msg_text = (
+        "🌐 <b>تنظیمات پروکسی:</b>\n\n"
+        "لطفاً پروکسی‌های خود را بفرستید (پیام متنی یا فایل .txt).\n"
+        "برای لغو، <code>/cancel</code> را ارسال کنید."
+    )
+    msg = bot.reply_to(message, msg_text, parse_mode="HTML")
+    bot.register_next_step_handler(msg, process_proxy_list)
+
 
 @bot.message_handler(content_types=['document'])
 def handle_docs(message):
     if message.from_user.id not in ADMIN_IDS:
         return
-    if message.document and message.document.file_name.endswith('.txt'):
+    if message.document and message.document.file_name and message.document.file_name.endswith('.txt'):
         process_proxy_list(message)
+
 
 def process_proxy_list(message):
     chat_id = message.chat.id
+    is_admin = message.from_user.id in ADMIN_IDS
+
+    if message.text and (message.text.startswith('/') or message.text in MENU_BUTTONS):
+        bot.send_message(chat_id, "↩️ تنظیم پروکسی لغو شد.", reply_markup=get_main_keyboard(is_admin))
+        return
+
     proxies_list = []
     try:
         if message.document:
             file_info = bot.get_file(message.document.file_id)
             downloaded_file = bot.download_file(file_info.file_path)
-            content = downloaded_file.decode('utf-8').splitlines()
+            content = downloaded_file.decode('utf-8', errors='replace').splitlines()
             for line in content:
                 p = format_proxy(line)
                 if p:
@@ -439,11 +535,16 @@ def process_proxy_list(message):
 
         if proxies_list:
             user_proxies[chat_id] = proxies_list
-            bot.send_message(chat_id, f"✅ تعداد {len(proxies_list)} پروکسی تنظیم شد.\n\nاکنون شماره موبایل را بفرستید.", reply_markup=get_main_keyboard())
+            bot.send_message(
+                chat_id,
+                f"✅ تعداد {len(proxies_list)} پروکسی تنظیم شد.\n\nاکنون شماره موبایل را بفرستید.",
+                reply_markup=get_main_keyboard(is_admin),
+            )
         else:
-            bot.send_message(chat_id, "❌ پروکسی معتبری یافت نشد!", reply_markup=get_main_keyboard())
+            bot.send_message(chat_id, "❌ پروکسی معتبری یافت نشد!", reply_markup=get_main_keyboard(is_admin))
     except Exception as e:
-        bot.send_message(chat_id, f"❌ خطا در پردازش پروکسی: {e}", reply_markup=get_main_keyboard())
+        bot.send_message(chat_id, f"❌ خطا در پردازش پروکسی: {e}", reply_markup=get_main_keyboard(is_admin))
+
 
 # ================= Phone & OTP Handlers =================
 @bot.message_handler(func=lambda m: m.text and normalize_digits(m.text).startswith("09") and len(normalize_digits(m.text)) == 11)
@@ -451,12 +552,13 @@ def process_phone_step(message):
     if message.from_user.id not in ADMIN_IDS:
         return
     chat_id = message.chat.id
+    is_admin = True
     phone = normalize_digits(message.text)
+    logs = [f"====== [ شروع عملیات برای: {phone} ] ======"]
 
     try:
         bot.send_message(chat_id, f"⏳ در حال برقراری ارتباط برای شماره {phone}...")
         session = requests.Session()
-        logs = [f"====== [ شروع عملیات برای: {phone} ] ======"]
 
         proxies = user_proxies.get(chat_id, [])
         if proxies:
@@ -490,14 +592,14 @@ def process_phone_step(message):
         logs.append(f"▶️ GET Auth URL | Status: {res.status_code}")
 
         if res.status_code == 403:
-            send_final_file(chat_id, "❌ آی‌پی سرور توسط دیجی‌کالا مسدود است (403). حتماً پروکسی ایرانی تنظیم کنید.", logs)
+            send_final_file(chat_id, "❌ آی‌پی سرور توسط دیجی‌کالا مسدود است (403). حتماً پروکسی ایرانی تنظیم کنید.", logs, is_admin=is_admin)
             return
 
         soup = BeautifulSoup(res.text, 'html.parser')
         form = soup.find('form')
 
         if not form:
-            send_final_file(chat_id, "❌ خطا: فرم ورود در سایت یافت نشد.", logs)
+            send_final_file(chat_id, "❌ خطا: فرم ورود در سایت یافت نشد.", logs, is_admin=is_admin)
             return
 
         action_url = form.get('action').replace('&amp;', '&')
@@ -524,7 +626,7 @@ def process_phone_step(message):
                     soup = BeautifulSoup(res.text, 'html.parser')
             else:
                 logs.append("❌ خطا: فیلد otp-auth-execution پیدا نشد.")
-                send_final_file(chat_id, "❌ ساختار فرم رمز تغییر کرده است.", logs)
+                send_final_file(chat_id, "❌ ساختار فرم رمز تغییر کرده است.", logs, is_admin=is_admin)
                 return
         else:
             logs.append("⚡ اکانت بدون رمز عبور است. هدایت مستقیم به پیامک.")
@@ -533,7 +635,7 @@ def process_phone_step(message):
         if not form_otp or not soup.find('input', {'name': 'code'}):
             snippet = res.text[:200].replace('\n', ' ')
             logs.append(f"❌ فرم دریافت پیامک یافت نشد:\n{snippet}")
-            send_final_file(chat_id, "❌ فرم پیامک باز نشد. پروکسی خود را تغییر دهید.", logs)
+            send_final_file(chat_id, "❌ فرم پیامک باز نشد. پروکسی خود را تغییر دهید.", logs, is_admin=is_admin)
             return
 
         otp_action_url = form_otp.get('action').replace('&amp;', '&')
@@ -548,22 +650,30 @@ def process_phone_step(message):
             'logs': logs
         }
 
-        msg_reply = bot.send_message(chat_id, "✅ پیامک ارسال شد!\n\nلطفاً کد تایید ۵ یا ۶ رقمی را بفرستید:")
+        msg_reply = bot.send_message(chat_id, "✅ پیامک ارسال شد!\n\nلطفاً کد تایید ۵ یا ۶ رقمی را بفرستید (یا /cancel برای لغو):")
         bot.register_next_step_handler(msg_reply, process_code_step)
 
     except requests.exceptions.ProxyError:
-        send_final_file(chat_id, "❌ پروکسی شما کار نمی‌کند، لطفاً پروکسی جدید ثبت کنید.", logs)
+        send_final_file(chat_id, "❌ پروکسی شما کار نمی‌کند، لطفاً پروکسی جدید ثبت کنید.", logs, is_admin=is_admin)
     except requests.exceptions.Timeout:
-        send_final_file(chat_id, "❌ زمان اتصال به سرور دیجی‌کالا به پایان رسید (Timeout).", logs)
+        send_final_file(chat_id, "❌ زمان اتصال به سرور دیجی‌کالا به پایان رسید (Timeout).", logs, is_admin=is_admin)
     except Exception as e:
-        bot.send_message(chat_id, f"❌ خطای پیش‌بینی نشده در شروع عملیات: {str(e)}", reply_markup=get_main_keyboard())
+        bot.send_message(chat_id, f"❌ خطای پیش‌بینی نشده در شروع عملیات: {str(e)}", reply_markup=get_main_keyboard(is_admin))
+
 
 def process_code_step(message):
     chat_id = message.chat.id
-    code = normalize_digits(message.text.strip())
+    is_admin = message.from_user.id in ADMIN_IDS
+
+    if message.text and (message.text.startswith('/') or message.text in MENU_BUTTONS):
+        user_data.pop(chat_id, None)
+        bot.send_message(chat_id, "↩️ عملیات ورود لغو شد.", reply_markup=get_main_keyboard(is_admin))
+        return
+
+    code = normalize_digits((message.text or "").strip())
 
     if chat_id not in user_data:
-        bot.send_message(chat_id, "⚠️ نشست شما منقضی شد. لطفاً مجدداً شماره را بفرستید.", reply_markup=get_main_keyboard())
+        bot.send_message(chat_id, "⚠️ نشست شما منقضی شد. لطفاً مجدداً شماره را بفرستید.", reply_markup=get_main_keyboard(is_admin))
         return
 
     udata = user_data[chat_id]
@@ -571,7 +681,7 @@ def process_code_step(message):
     logs = udata['logs']
     phone = udata['phone']
 
-    bot.send_message(chat_id, "⏳ در حال بررسی کد و استعلام سوابق خرید...")
+    bot.send_message(chat_id, "⏳ در حال بررسی کد و استعلام سابقه خرید...")
     logs.append(f"💬 کد وارد شده: {code}")
 
     try:
@@ -590,7 +700,7 @@ def process_code_step(message):
                 auth_code = cmatch.group(1)
 
         if not auth_code:
-            send_final_file(chat_id, "❌ کد تایید اشتباه یا منقضی شده است.", logs)
+            send_final_file(chat_id, "❌ کد تایید اشتباه یا منقضی شده است.", logs, is_admin=is_admin)
             return
 
         token_data = {
@@ -600,125 +710,138 @@ def process_code_step(message):
             "redirect_uri": udata['redirect_uri'],
             "code_verifier": udata['verifier']
         }
-        res_token = session.post("https://auth.digikala.com/realms/dk-group/protocol/openid-connect/token", data=token_data, timeout=12)
+        res_token = session.post(
+            "https://auth.digikala.com/realms/dk-group/protocol/openid-connect/token",
+            data=token_data,
+            timeout=12,
+        )
         logs.append(f"◀️ Token Exchange | Status: {res_token.status_code}")
 
-        if res_token.status_code == 200:
-            tokens = res_token.json()
-            access_token = tokens.get('access_token')
-            refresh_token = tokens.get('refresh_token')
+        if res_token.status_code != 200:
+            send_final_file(chat_id, "❌ خطا در دریافت توکن نهایی از سرور دیجی‌کالا.", logs, is_admin=is_admin)
+            return
 
-            session.cookies.set("Digikala:User:Token:v2", access_token, domain=".api.digikala.com", path="/", secure=True)
-            if refresh_token:
-                session.cookies.set("Digikala:User:Refresh:Token:v2", refresh_token, domain=".api.digikala.com", path="/v1/user/", secure=True)
+        tokens = res_token.json()
+        access_token = tokens.get('access_token')
+        refresh_token = tokens.get('refresh_token')
 
-            # بررسی دقیق سابقه خرید به روش jet_cleaner
-            verdict, total_orders, jet_tok, jet_ref = check_purchase_history(session, access_token, logs)
+        session.cookies.set("Digikala:User:Token:v2", access_token, domain=".api.digikala.com", path="/", secure=True)
+        if refresh_token:
+            session.cookies.set("Digikala:User:Refresh:Token:v2", refresh_token, domain=".api.digikala.com", path="/v1/user/", secure=True)
 
-            # ۱. اگر اکانت خرید داشته باشد -> ذخیره نشود و در صورت وجود قبلی از ردیس پاک شود
-            if verdict == 'ordered':
-                delete_account_from_redis(phone)
-                logs.append(f"🚫 اکانت دارای {total_orders} سابقه خرید است. طبق دستور، ذخیره نشد و از ردیس حذف گردید.")
-                final_message = (
-                    f"🚫 **اکانت دارای سابقه خرید است!**\n\n"
-                    f"📱 شماره: `{phone}`\n"
-                    f"🛍 تعداد سفارش‌ها: `{total_orders}`\n\n"
-                    f"❌ این اکانت در دیتابیس ذخیره نشد و هیچ لینکی برای آن ساخته نشد."
-                )
-                send_final_file(chat_id, final_message, logs)
-                return
+        total_orders, jet_token, jet_refresh = check_purchase_history(session, access_token, logs)
 
-            # ۲. اگر در ارتباط با جت خطا رخ داده باشد -> برای جلوگیری از ورود اکانت خریددار، ذخیره نشود
-            if verdict == 'error':
-                logs.append("⚠️ به دلیل عدم امکان استعلام دقیق سابقه خرید از سرور جت، اکانت ذخیره نشد.")
-                final_message = (
-                    f"⚠️ **خطا در استعلام سابقه خرید از جت!**\n\n"
-                    f"برای جلوگیری از ذخیره شدن اکانت‌های خریددار، این نشست ذخیره نشد. لطفاً مجدداً تلاش کنید."
-                )
-                send_final_file(chat_id, final_message, logs)
-                return
+        # حالت ۱: خطا در بررسی سابقه خرید -> ذخیره نمی‌شود
+        if total_orders is None:
+            logs.append("⛔ به دلیل خطا در بررسی سابقه خرید، اکانت ذخیره نشد.")
+            send_final_file(
+                chat_id,
+                "⚠️ ورود انجام شد اما بررسی سابقه خرید با خطا مواجه شد؛ بنابراین برای اطمینان این اکانت ذخیره نشد.",
+                logs,
+                is_admin=is_admin,
+            )
+            return
 
-            # ۳. اکانت کاملاً تمیز و بدون سابقه خرید است (verdict == 'clean' and total_orders == 0)
-            extension_cookies = []
-            for cookie in session.cookies:
-                extension_cookies.append({
-                    "domain": cookie.domain,
-                    "hostOnly": not cookie.domain.startswith('.'),
-                    "httpOnly": 'HttpOnly' in cookie._rest if cookie._rest else False,
-                    "name": cookie.name,
-                    "path": cookie.path,
-                    "sameSite": "lax",
-                    "secure": cookie.secure or True,
-                    "session": cookie.expires is None,
-                    "storeId": "0",
-                    "value": cookie.value,
-                    "expirationDate": int(time.time()) + (30 * 24 * 60 * 60)
-                })
-
-            # قرار دادن توکن جت در origins برای سازگاری با jet_cleaner.py و اپلیکیشن
-            jet_origins = build_jet_origins(jet_tok, jet_ref, phone)
-            final_json = {"cookies": extension_cookies, "origins": jet_origins}
-            final_json_str = json.dumps(final_json, ensure_ascii=False)
-            session_token = secrets.token_urlsafe(14)
-            generated_link = f"{WEBHOOK_URL}/auth/{session_token}"
-
-            # ذخیره اکانت تمیز در ردیس همراه با بکاپ و لیست شماره‌های پردازش‌شده
+        # حالت ۲: اکانت دارای سابقه خرید است -> ذخیره نمی‌شود
+        if total_orders > 0:
+            logs.append(f"🚫 اکانت دارای {total_orders} سفارش است -> ذخیره نشد.")
             if redis_client:
                 try:
-                    # اگر قبلاً لینک قدیمی داشته، سشن قدیمی را پاک می‌کنیم
-                    old_rec = redis_client.hget("jet:bulk_accounts", phone)
-                    if old_rec:
-                        try:
-                            old_tok = json.loads(old_rec).get("token")
-                            if old_tok:
-                                redis_client.delete(f"jet_session:{old_tok}")
-                                redis_client.hdel("jet:session_backups", old_tok)
-                        except Exception:
-                            pass
+                    redis_client.incr("jet:stats:skipped_ordered")
+                except Exception:
+                    pass
+            send_final_file(
+                chat_id,
+                f"🚫 این اکانت دارای {total_orders} سابقه خرید است و طبق تنظیمات ذخیره نشد.",
+                logs,
+                is_admin=is_admin,
+            )
+            return
 
-                    record = {
-                        "phone": phone,
-                        "token": session_token,
-                        "name": "کاربر دیجی‌کالا",
-                        "data": final_json,
-                        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # حالت ۳: اکانت خام است (total_orders == 0) -> ساخت لینک و ذخیره
+        extension_cookies = []
+        for cookie in session.cookies:
+            extension_cookies.append({
+                "domain": cookie.domain,
+                "hostOnly": not cookie.domain.startswith('.'),
+                "httpOnly": 'HttpOnly' in cookie._rest if cookie._rest else False,
+                "name": cookie.name,
+                "path": cookie.path,
+                "sameSite": "lax",
+                "secure": cookie.secure or True,
+                "session": cookie.expires is None,
+                "storeId": "0",
+                "value": cookie.value,
+                "expirationDate": int(time.time()) + (30 * 24 * 60 * 60)
+            })
+
+        # ذخیره توکن جت در origins مطابق ساختار jet_cleaner.py (persist:DKNow)
+        origins = []
+        if jet_token:
+            dknow_user = {"token": jet_token}
+            if jet_refresh:
+                dknow_user["refreshToken"] = jet_refresh
+            origins.append({
+                "origin": "https://www.digikalajet.com",
+                "localStorage": [
+                    {
+                        "name": "persist:DKNow",
+                        "value": json.dumps(
+                            {"user": json.dumps(dknow_user, ensure_ascii=False)},
+                            ensure_ascii=False,
+                        ),
                     }
-                    pipe = redis_client.pipeline()
-                    pipe.setex(f"jet_session:{session_token}", 30 * 24 * 3600, final_json_str)
-                    pipe.hset("jet:session_backups", session_token, final_json_str)
-                    pipe.hset("jet:bulk_accounts", phone, json.dumps(record, ensure_ascii=False))
-                    pipe.sadd("jet:processed_phones", phone)
-                    pipe.execute()
+                ],
+            })
 
-                    total_links = redis_client.hlen("jet:bulk_accounts")
-                    order_status_text = (
-                        f"✅ اکانت خام و بدون سابقه خرید است (0 سفارش).\n"
-                        f"🔗 لینک ورود: {generated_link}\n"
-                        f"📊 کل لینک‌های بدون خرید موجود: {total_links}"
-                    )
-                except Exception as e:
-                    logs.append(f"❌ خطای ردیس: {e}")
-                    order_status_text = "⚠️ اکانت بدون خرید است اما در ذخیره ردیس خطا رخ داد."
-            else:
-                order_status_text = "⚠️ ردیس متصل نیست."
+        final_json = {"cookies": extension_cookies, "origins": origins}
+        final_json_str = json.dumps(final_json, ensure_ascii=False)
+        session_token = secrets.token_urlsafe(14)
+        generated_link = f"{WEBHOOK_URL}/auth/{session_token}"
 
+        if redis_client:
             try:
-                with open("clean_accounts.txt", "a", encoding="utf-8") as f:
-                    f.write(f"{json.dumps({'phone': phone, 'link': generated_link, 'data': final_json}, ensure_ascii=False)}\n")
-            except Exception:
-                pass
-
-            payload = {"phone": phone, "name": "کاربر دیجی‌کالا", "orders_count": 0, "link": generated_link, "data": final_json}
-            final_message = f"✅ ورود موفقیت‌آمیز بود!\n\n{order_status_text}\n\nفایل دیتای کاربر در حال ارسال است..."
-            send_final_file(chat_id, final_message, logs, payload)
+                pipe = redis_client.pipeline()
+                pipe.setex(f"jet_session:{session_token}", 30 * 24 * 3600, final_json_str)
+                pipe.hset("jet:session_backups", session_token, final_json_str)
+                record = {
+                    "phone": phone,
+                    "token": session_token,
+                    "name": "کاربر دیجی‌کالا",
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "data": final_json,
+                }
+                pipe.hset("jet:bulk_accounts", phone, json.dumps(record, ensure_ascii=False))
+                pipe.incr("jet:stats:created_links")
+                pipe.execute()
+                order_status_text = f"✅ اکانت بدون سفارش (0 خرید) است و ذخیره شد.\n🔗 لینک ورود: {generated_link}"
+            except Exception as e:
+                logs.append(f"❌ خطای ردیس: {e}")
+                order_status_text = "⚠️ اکانت بدون سفارش است اما ذخیره در ردیس با خطا مواجه شد."
         else:
-            send_final_file(chat_id, "❌ خطا در دریافت توکن نهایی از سرور دیجی‌کالا.", logs)
+            order_status_text = "⚠️ اکانت بدون سفارش است (ردیس متصل نیست)."
+
+        try:
+            with open(CLEAN_ACCOUNTS_FILE, "a", encoding="utf-8") as f:
+                f.write(f"{json.dumps({'phone': phone, 'link': generated_link, 'data': final_json}, ensure_ascii=False)}\n")
+        except Exception:
+            pass
+
+        payload = {
+            "phone": phone,
+            "name": "کاربر دیجی‌کالا",
+            "orders_count": 0,
+            "link": generated_link,
+            "data": final_json,
+        }
+        final_message = f"✅ ورود موفقیت‌آمیز بود!\n\n🛍 {order_status_text}\n\nفایل دیتای کاربر در حال ارسال است..."
+        send_final_file(chat_id, final_message, logs, payload, is_admin=is_admin)
 
     except Exception as e:
-        bot.send_message(chat_id, f"❌ خطا در پردازش کد تایید: {str(e)}", reply_markup=get_main_keyboard())
+        bot.send_message(chat_id, f"❌ خطا در پردازش کد تایید: {str(e)}", reply_markup=get_main_keyboard(is_admin))
     finally:
-        if chat_id in user_data:
-            del user_data[chat_id]
+        user_data.pop(chat_id, None)
+
 
 # ================= Secure Gateway Web Route =================
 async def web_secure_gateway(request: web.Request):
@@ -728,9 +851,6 @@ async def web_secure_gateway(request: web.Request):
 
     try:
         session_data_str = redis_client.get(f"jet_session:{token_key}")
-        # بازیابی خودکار از بکاپ در صورت منقضی شدن کلید اصلی
-        if not session_data_str:
-            session_data_str = redis_client.hget("jet:session_backups", token_key)
     except Exception:
         session_data_str = None
 
@@ -743,8 +863,14 @@ async def web_secure_gateway(request: web.Request):
     if app_header == APP_SECRET_HEADER or "JetAppClient" in user_agent:
         return web.json_response({"status": "success", "session": json.loads(session_data_str)})
 
-    html_blocked = '<html dir="rtl" lang="fa"><meta charset="UTF-8"><body style="font-family:Tahoma;text-align:center;margin-top:50px;"><h3>دسترسی مسدود است</h3><p>لینک فقط در اپلیکیشن باز می‌شود.</p></body></html>'
+    html_blocked = (
+        '<html dir="rtl" lang="fa"><meta charset="UTF-8">'
+        '<body style="font-family:Tahoma;text-align:center;margin-top:50px;">'
+        '<h3>دسترسی مسدود است</h3><p>لینک فقط در اپلیکیشن باز می‌شود.</p>'
+        '</body></html>'
+    )
     return web.Response(text=html_blocked, content_type="text/html")
+
 
 def run_bot():
     logging.info("🤖 ربات تلگرام روشن شد...")
@@ -754,6 +880,7 @@ def run_bot():
         except Exception as e:
             logging.error(f"Polling Crash Restarting... {e}")
             time.sleep(3)
+
 
 if __name__ == "__main__":
     t = threading.Thread(target=run_bot, daemon=True)
