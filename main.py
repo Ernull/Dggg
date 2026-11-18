@@ -98,6 +98,52 @@ def format_proxy(p_str):
     return p_str
 
 
+def extract_hidden_inputs(form):
+    """استخراج فیلدهای مخفی فرم برای جلوگیری از رد شدن درخواست توسط Keycloak"""
+    payload = {}
+    if not form:
+        return payload
+    for inp in form.find_all('input', {'type': 'hidden'}):
+        name = inp.get('name')
+        if name:
+            payload[name] = inp.get('value', '')
+    return payload
+
+
+def extract_auth_code_from_url(url_str):
+    """استخراج دقیق پارامتر code از query یا fragment بدون اشتباه گرفتن با session_code"""
+    if not url_str:
+        return None
+    parsed = urllib.parse.urlparse(url_str)
+    for part in (parsed.fragment, parsed.query):
+        if part:
+            qs = urllib.parse.parse_qs(part)
+            if 'code' in qs and qs['code']:
+                return qs['code'][0]
+    match = re.search(r'(?:^|[?&#])code=([^&#"\'\s<>]+)', url_str)
+    return urllib.parse.unquote(match.group(1)) if match else None
+
+
+def extract_html_error(html_text):
+    """استخراج پیام خطای صفحه Keycloak در صورت عدم ورود موفق"""
+    try:
+        soup = BeautifulSoup(html_text, 'html.parser')
+        for selector in (
+            '.kc-feedback-text',
+            '.alert-error',
+            '[id*="error"]',
+            '[class*="error"]',
+            '.input-error',
+        ):
+            el = soup.select_one(selector)
+            if el and el.get_text(strip=True):
+                return el.get_text(" ", strip=True)[:250]
+        title = soup.title.get_text(strip=True) if soup.title else ""
+        return title[:150] if title else ""
+    except Exception:
+        return ""
+
+
 def get_main_keyboard(is_admin=False):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     btn_clean = types.KeyboardButton("📦 دریافت حساب‌های بدون سفارش")
@@ -231,7 +277,7 @@ def extract_sa_token_from_url(url_str):
     qs = urllib.parse.parse_qs(parsed.query)
     if 'sa_token' in qs and qs['sa_token']:
         return qs['sa_token'][0]
-    match = re.search(r'sa_token=([^&]+)', url_str)
+    match = re.search(r'(?:^|[?&#])sa_token=([^&#"\'\s<>]+)', url_str)
     return urllib.parse.unquote(match.group(1)) if match else None
 
 
@@ -603,8 +649,10 @@ def process_phone_step(message):
             return
 
         action_url = form.get('action').replace('&amp;', '&')
+        phone_payload = extract_hidden_inputs(form)
+        phone_payload.update({"username": phone, "rememberMe": "on"})
         session.headers.update({"Referer": res.url})
-        res = session.post(action_url, data={"username": phone, "rememberMe": "on"}, timeout=12)
+        res = session.post(action_url, data=phone_payload, timeout=12)
         logs.append(f"◀️ POST Phone Response | Status: {res.status_code}")
 
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -633,18 +681,20 @@ def process_phone_step(message):
 
         form_otp = soup.find('form')
         if not form_otp or not soup.find('input', {'name': 'code'}):
-            snippet = res.text[:200].replace('\n', ' ')
+            snippet = res.text[:250].replace('\n', ' ')
             logs.append(f"❌ فرم دریافت پیامک یافت نشد:\n{snippet}")
             send_final_file(chat_id, "❌ فرم پیامک باز نشد. پروکسی خود را تغییر دهید.", logs, is_admin=is_admin)
             return
 
         otp_action_url = form_otp.get('action').replace('&amp;', '&')
+        otp_hidden_fields = extract_hidden_inputs(form_otp)
         session.headers.update({"Referer": res.url})
 
         user_data[chat_id] = {
             'phone': phone,
             'session': session,
             'otp_action_url': otp_action_url,
+            'otp_hidden_fields': otp_hidden_fields,
             'verifier': verifier,
             'redirect_uri': redirect_uri,
             'logs': logs
@@ -685,22 +735,52 @@ def process_code_step(message):
     logs.append(f"💬 کد وارد شده: {code}")
 
     try:
-        session.headers.update({"Referer": "https://auth.digikala.com/"})
-        res = session.post(udata['otp_action_url'], data={"code": code}, allow_redirects=False, timeout=12)
+        otp_payload = dict(udata.get('otp_hidden_fields') or {})
+        otp_payload["code"] = code
+
+        session.headers.update({"Referer": udata['otp_action_url']})
+        res = session.post(udata['otp_action_url'], data=otp_payload, allow_redirects=False, timeout=12)
         logs.append(f"▶️ POST OTP Code | Status: {res.status_code}")
 
         auth_code = None
-        if 'Location' in res.headers:
-            cmatch = re.search(r'code=([^&]+)', res.headers['Location'])
-            if cmatch:
-                auth_code = cmatch.group(1)
-        if not auth_code:
-            cmatch = re.search(r'code=([^&]+)', res.text)
-            if cmatch:
-                auth_code = cmatch.group(1)
+        curr_res = res
+        # دنبال کردن ریدایرکت‌های میانی auth تا رسیدن به sso-redirect و استخراج code واقعی
+        for hop in range(5):
+            loc = curr_res.headers.get('Location')
+            if loc:
+                logs.append(f"↪️ Redirect #{hop + 1}: {loc[:120]}")
+                auth_code = extract_auth_code_from_url(loc)
+                if auth_code:
+                    break
+                if loc.startswith('/'):
+                    loc = urllib.parse.urljoin(curr_res.url, loc)
+                curr_res = session.get(loc, allow_redirects=False, timeout=12)
+                logs.append(f"▶️ Follow Redirect #{hop + 1} | Status: {curr_res.status_code}")
+            else:
+                break
 
         if not auth_code:
-            send_final_file(chat_id, "❌ کد تایید اشتباه یا منقضی شده است.", logs, is_admin=is_admin)
+            auth_code = extract_auth_code_from_url(curr_res.url)
+
+        if not auth_code and curr_res.status_code == 200:
+            # فقط در صورت وجود لینک sso-redirect در صفحه، code را استخراج کن (نه session_code فرم!)
+            sso_match = re.search(r'sso-redirect[^"\'\s<>]+', curr_res.text)
+            if sso_match:
+                auth_code = extract_auth_code_from_url(sso_match.group(0))
+
+        if not auth_code:
+            page_err = extract_html_error(curr_res.text)
+            if page_err:
+                logs.append(f"❌ پیام صفحه دیجی‌کالا: {page_err}")
+            snippet = curr_res.text[:350].replace('\n', ' ')
+            logs.append(f"🔎 HTML Snippet: {snippet}")
+            err_notice = f" ({page_err})" if page_err else ""
+            send_final_file(
+                chat_id,
+                f"❌ کد تایید پذیرفته نشد یا منقضی شده است{err_notice}.",
+                logs,
+                is_admin=is_admin,
+            )
             return
 
         token_data = {
@@ -718,6 +798,7 @@ def process_code_step(message):
         logs.append(f"◀️ Token Exchange | Status: {res_token.status_code}")
 
         if res_token.status_code != 200:
+            logs.append(f"❌ Token Error Body: {res_token.text[:400]}")
             send_final_file(chat_id, "❌ خطا در دریافت توکن نهایی از سرور دیجی‌کالا.", logs, is_admin=is_admin)
             return
 
